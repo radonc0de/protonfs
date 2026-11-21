@@ -1,0 +1,17 @@
+{
+  "name": "protonfs-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Proton Drive SDK sidecar for protonfs",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@protontech/crypto": "2.2.0",
+    "@protontech/drive-sdk": "0.24.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

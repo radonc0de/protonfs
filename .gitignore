@@ -1,0 +1,12 @@
+# build output
+/protonfs
+/dist/
+bridge/dist/
+bridge/node_modules/
+
+# local/editor junk
+*.log
+*.swp
+.DS_Store
+.env
+.env.*
