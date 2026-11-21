@@ -230,6 +230,9 @@ func (f *FS) mergeLocked(dir *entry, nodes []remoteNode) {
 		e.name, e.parent = name, dir
 		busy := e.uploading || (e.local != nil && e.local.dirty)
 		if !busy {
+			if e.revUID != "" && e.revUID != n.RevUID {
+				f.cache.Forget(e.revUID) // changed elsewhere; old content is stale
+			}
 			e.size, e.revUID = n.Size, n.RevUID
 			if n.Mtime > 0 {
 				e.mtime = time.UnixMilli(n.Mtime)
@@ -240,13 +243,24 @@ func (f *FS) mergeLocked(dir *entry, nodes []remoteNode) {
 		}
 		fresh[name] = e
 	}
+	kept := make(map[*entry]bool, len(fresh))
+	for _, e := range fresh {
+		kept[e] = true
+	}
 	// Keep local-only state that the server doesn't know about yet.
 	for name, c := range dir.children {
-		if _, ok := fresh[name]; ok {
+		if kept[c] {
 			continue
 		}
 		if c.uid == "" || c.uploading || (c.local != nil && c.local.dirty) {
-			fresh[name] = c
+			if _, taken := fresh[name]; !taken {
+				fresh[name] = c
+			}
+			continue
+		}
+		// Deleted or moved away elsewhere: drop its cached content.
+		if !c.dir {
+			f.cache.Forget(cacheRevOf(c))
 		}
 	}
 	dir.children = fresh
@@ -575,6 +589,9 @@ func (f *FS) startUploadLocked(e *entry) {
 			return
 		}
 		e.failures = 0
+		if e.revUID != res.RevUID {
+			f.cache.Forget(e.revUID) // superseded by the revision we just uploaded
+		}
 		e.uid, e.revUID, e.size = res.UID, res.RevUID, res.Size
 		log.Printf("uploaded %s (%d bytes)", p, res.Size)
 		if e.removed {
@@ -860,6 +877,9 @@ func (f *FS) removeEntry(c *entry) syscall.Errno {
 	defer f.mu.Unlock()
 	if c.parent != nil && c.parent.children[c.name] == c {
 		delete(c.parent.children, c.name)
+	}
+	if !c.dir && c.uid != "" {
+		f.cache.Forget(cacheRevOf(c))
 	}
 	if c.openCount == 0 {
 		f.dropLocalLocked(c)

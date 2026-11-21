@@ -22,7 +22,7 @@ func put(t *testing.T, c *Cache, revUID string, n int) {
 }
 
 func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
-	c, err := OpenCache(t.TempDir(), 300)
+	c, err := OpenCache(t.TempDir(), 300, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
 }
 
 func TestCacheNeverEvictsPinned(t *testing.T) {
-	c, err := OpenCache(t.TempDir(), 100)
+	c, err := OpenCache(t.TempDir(), 100, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,12 +66,12 @@ func TestCacheNeverEvictsPinned(t *testing.T) {
 
 func TestCacheReopenRecoversState(t *testing.T) {
 	dir := t.TempDir()
-	c, _ := OpenCache(dir, 1000)
+	c, _ := OpenCache(dir, 1000, 0)
 	put(t, c, "a", 10)
 	os.WriteFile(c.PartPath("partial"), []byte("x"), 0o600)
 	os.WriteFile(c.NewDirtyPath(), []byte("unsaved"), 0o600)
 
-	c2, err := OpenCache(dir, 1000)
+	c2, err := OpenCache(dir, 1000, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,5 +84,48 @@ func TestCacheReopenRecoversState(t *testing.T) {
 	lf, _ := os.ReadDir(filepath.Join(dir, "lost+found"))
 	if len(lf) != 1 {
 		t.Errorf("lost+found has %d files, want 1", len(lf))
+	}
+}
+
+func TestCacheForget(t *testing.T) {
+	c, _ := OpenCache(t.TempDir(), 1000, 0)
+	put(t, c, "a", 10)
+	put(t, c, "b", 10)
+
+	c.Forget("a")
+	if c.Acquire("a") != "" {
+		t.Error("forgotten a still cached")
+	}
+
+	// Pinned: kept while open, dropped on release.
+	p := c.Acquire("b")
+	c.Forget("b")
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("pinned b deleted while open")
+	}
+	c.Release("b")
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Error("forgotten b not deleted on release")
+	}
+	if got := c.Usage(); got != 0 {
+		t.Errorf("usage = %d, want 0", got)
+	}
+}
+
+func TestCacheMaxAge(t *testing.T) {
+	dir := t.TempDir()
+	c, _ := OpenCache(dir, 1000, 0)
+	put(t, c, "old", 10)
+	put(t, c, "new", 10)
+	// Age "old" on disk; the index is rebuilt from mtimes on open.
+	old := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(c.path(revKey("old")), old, old)
+
+	c2, _ := OpenCache(dir, 1000, 24*time.Hour)
+	if c2.Acquire("old") != "" {
+		t.Error("file unused for 48h survived a 24h max age")
+	}
+	if c2.Acquire("new") == "" {
+		t.Error("recent file evicted")
 	}
 }

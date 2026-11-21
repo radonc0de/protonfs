@@ -36,7 +36,8 @@ The installer signs you in to Proton, asks where to mount, and sets up a systemd
 
 - **Reads stream.** Opening a file starts a background download into the cache, and reads return as soon as the bytes they need have arrived. Cached files are keyed by revision, so they stay valid across remounts and reboots.
 - **Writes are local, then uploaded.** Changes go to a local copy. About a second after the last writer closes the file, it is uploaded as a new file or a new revision; `fsync` uploads immediately and waits. On stop or logout protonfs finishes pending uploads before exiting.
-- **The cache is bounded.** It holds at most `PROTONFS_CACHE_SIZE` (default 10G), evicting least-recently-used files first. Unsaved changes are never evicted.
+- **The cache is bounded.** It holds at most `PROTONFS_CACHE_SIZE` (default 10G), evicting least-recently-used files first. Files you delete, and old versions of files that changed (here or elsewhere), are removed from the cache right away. `PROTONFS_CACHE_MAX_AGE` (e.g. `30d`) also drops files not used for that long. Open files and unsaved changes are never evicted.
+- **Crash recovery:** if protonfs is killed before uploading changes, the unsaved copies are moved to `lost+found/` in that mount's cache directory and a warning is logged at every start until you delete them. `protonfs cache` shows where they are.
 - **Deleting moves items to Proton's trash** unless `PROTONFS_DELETE=permanent`.
 
 ## Requirements
@@ -55,18 +56,22 @@ protonfs enable ~/ProtonDrive      # mount now and at every login
 protonfs enable ~/Proton --linger  # ...and stay mounted after logout
 protonfs status
 protonfs disable ~/ProtonDrive
+protonfs disable ~/ProtonDrive --purge   # ...and delete its cache
+protonfs cache                     # cache usage per mount
+protonfs cache clear [~/ProtonDrive]     # empty the cache (restarts the mount)
 protonfs mount ~/ProtonDrive       # one-off, in the foreground
 protonfs login                     # re-sign-in if the session expires
 journalctl --user -u 'protonfs@*' -f
 ```
 
-Several directories can be mounted at once; each one gets its own service (`protonfs@<path>.service`) and its own cache.
+Several directories can be mounted at once; each one gets its own service (`protonfs@<path>.service`) and its own cache under `~/.cache/protonfs/`.
 
 Settings go in `~/.config/protonfs/config.env`:
 
 | Variable | Default | |
 |---|---|---|
 | `PROTONFS_CACHE_SIZE` | `10G` | Maximum local cache size (LRU) |
+| `PROTONFS_CACHE_MAX_AGE` | off | Also drop cached files unused this long, e.g. `30d`, `12h` |
 | `PROTONFS_TTL` | `30` | Seconds to cache directory listings; changes made elsewhere show up after this |
 | `PROTONFS_DELETE` | trash | Set to `permanent` to delete instead of trashing |
 | `PROTONFS_NODE` | auto | Node.js binary to use |

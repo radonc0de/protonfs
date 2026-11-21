@@ -32,14 +32,17 @@ const usage = `protonfs - Proton Drive as a filesystem
 Usage:
   protonfs login                 sign in to Proton (runs: proton-drive auth login)
   protonfs enable DIR [--linger] mount DIR now and at every login (systemd user service)
-  protonfs disable DIR           stop and remove the service for DIR
+  protonfs disable DIR [--purge] stop and remove the service for DIR (--purge: and its cache)
   protonfs status                list protonfs services
+  protonfs cache                 show cache usage per mount
+  protonfs cache clear [DIR]     delete cached files (all mounts, or DIR's)
   protonfs mount DIR             mount in the foreground (Ctrl-C to stop)
   protonfs unmount DIR           unmount
   protonfs version
 
 Settings (env or ~/.config/protonfs/config.env):
   PROTONFS_CACHE_SIZE=10G        max local cache (LRU); unsaved writes never evicted
+  PROTONFS_CACHE_MAX_AGE=30d     also drop cached files unused this long (default: off)
   PROTONFS_TTL=30                seconds to cache directory listings
   PROTONFS_DELETE=permanent      rm deletes permanently (default: Proton trash)
 `
@@ -63,6 +66,8 @@ func main() {
 		err = cmdDisable(args)
 	case "status":
 		err = cmdStatus()
+	case "cache":
+		err = cmdCache(args)
 	case "login":
 		err = cmdLogin()
 	case "version", "--version", "-v":
@@ -125,6 +130,24 @@ func loadConfig() {
 			os.Setenv(k, v)
 		}
 	}
+}
+
+// parseAge parses durations like 30d, 12h, 90m; "", "0" and "off" mean no limit.
+func parseAge(s string) (time.Duration, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	switch s {
+	case "", "0", "off", "none":
+		return 0, nil
+	}
+	if n, ok := strings.CutSuffix(s, "d"); ok {
+		if d, err := strconv.ParseFloat(n, 64); err == nil && d > 0 {
+			return time.Duration(d * float64(24*time.Hour)), nil
+		}
+	}
+	if d, err := time.ParseDuration(s); err == nil && d > 0 {
+		return d, nil
+	}
+	return 0, fmt.Errorf("invalid age %q (use e.g. 30d, 12h, or off)", s)
 }
 
 func parseSize(s string) (int64, error) {
@@ -226,6 +249,9 @@ func findBridge() (node, script string, err error) {
 	return node, script, nil
 }
 
+// mountMarker, inside a cache dir, records which mountpoint it belongs to.
+const mountMarker = "mountpoint"
+
 func instanceCacheDir(mnt string) string {
 	h := sha256.Sum256([]byte(mnt))
 	name := strings.Trim(strings.ReplaceAll(mnt, "/", "-"), "-")
@@ -259,6 +285,10 @@ func cmdMount(args []string) error {
 			return err
 		}
 	}
+	maxAge, err := parseAge(os.Getenv("PROTONFS_CACHE_MAX_AGE"))
+	if err != nil {
+		return fmt.Errorf("PROTONFS_CACHE_MAX_AGE: %w", err)
+	}
 	ttl := 30 * time.Second
 	if s := os.Getenv("PROTONFS_TTL"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil {
@@ -270,10 +300,11 @@ func cmdMount(args []string) error {
 	if err != nil {
 		return err
 	}
-	cache, err := pfs.OpenCache(instanceCacheDir(mnt), cacheSize)
+	cache, err := pfs.OpenCache(instanceCacheDir(mnt), cacheSize, maxAge)
 	if err != nil {
 		return fmt.Errorf("cache: %w", err)
 	}
+	os.WriteFile(filepath.Join(cache.Dir, mountMarker), []byte(mnt+"\n"), 0o600)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -329,8 +360,12 @@ func humanSize(n int64) string {
 		return fmt.Sprintf("%.1fT", float64(n)/(1<<40))
 	case n >= 1<<30:
 		return fmt.Sprintf("%.1fG", float64(n)/(1<<30))
-	default:
+	case n >= 1<<20:
 		return fmt.Sprintf("%dM", n>>20)
+	case n >= 1<<10:
+		return fmt.Sprintf("%dK", n>>10)
+	default:
+		return fmt.Sprintf("%dB", n)
 	}
 }
 
@@ -481,10 +516,20 @@ func isMounted(mnt string) bool {
 }
 
 func cmdDisable(args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: protonfs disable DIR")
+	purge := false
+	var dirs []string
+	for _, a := range args {
+		switch a {
+		case "--purge":
+			purge = true
+		default:
+			dirs = append(dirs, a)
+		}
 	}
-	mnt, err := absDir(args[0])
+	if len(dirs) != 1 {
+		return errors.New("usage: protonfs disable DIR [--purge]")
+	}
+	mnt, err := absDir(dirs[0])
 	if err != nil {
 		return err
 	}
@@ -492,7 +537,170 @@ func cmdDisable(args []string) error {
 	if err != nil {
 		return err
 	}
-	return systemctl("disable", "--now", name)
+	if err := systemctl("disable", "--now", name); err != nil {
+		return err
+	}
+	if !purge {
+		return nil
+	}
+	if isMounted(mnt) {
+		return fmt.Errorf("%s is still mounted (by something other than the service?); unmount it, then run: protonfs cache clear %s", mnt, mnt)
+	}
+	return purgeCacheDir(instanceCacheDir(mnt))
+}
+
+// purgeCacheDir deletes a mount's cache directory, except unsaved data in
+// lost+found.
+func purgeCacheDir(dir string) error {
+	lf := filepath.Join(dir, pfs.LostFound)
+	if n, _ := pfs.DirFiles(lf); n > 0 {
+		if err := clearCacheDir(dir); err != nil {
+			return err
+		}
+		os.Remove(filepath.Join(dir, mountMarker))
+		fmt.Printf("Removed cache %s, but kept %s: it holds %d file(s) of unsaved changes from a crash. Delete it yourself once you've checked them.\n", dir, lf, n)
+		return nil
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	fmt.Printf("Removed cache %s\n", dir)
+	return nil
+}
+
+// clearCacheDir deletes cached (clean) file contents in dir. The mount
+// must not be running.
+func clearCacheDir(dir string) error {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, de := range ents {
+		n := de.Name()
+		if strings.HasPrefix(n, "rev-") {
+			if err := os.Remove(filepath.Join(dir, n)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+type cacheInfo struct {
+	dir, mnt       string
+	n, nLost       int
+	size, lostSize int64
+}
+
+func listCaches() []cacheInfo {
+	ents, _ := os.ReadDir(cacheBase())
+	var out []cacheInfo
+	for _, de := range ents {
+		if !de.IsDir() {
+			continue
+		}
+		ci := cacheInfo{dir: filepath.Join(cacheBase(), de.Name())}
+		if b, err := os.ReadFile(filepath.Join(ci.dir, mountMarker)); err == nil {
+			ci.mnt = strings.TrimSpace(string(b))
+		}
+		ci.n, ci.size = cachedFiles(ci.dir)
+		ci.nLost, ci.lostSize = pfs.DirFiles(filepath.Join(ci.dir, pfs.LostFound))
+		out = append(out, ci)
+	}
+	return out
+}
+
+// cachedFiles counts cached (clean) file contents in a mount's cache dir.
+func cachedFiles(dir string) (n int, size int64) {
+	ents, _ := os.ReadDir(dir)
+	for _, de := range ents {
+		if info, err := de.Info(); err == nil && strings.HasPrefix(de.Name(), "rev-") && info.Mode().IsRegular() {
+			n++
+			size += info.Size()
+		}
+	}
+	return n, size
+}
+
+func cmdCache(args []string) error {
+	if len(args) == 0 {
+		caches := listCaches()
+		if len(caches) == 0 {
+			fmt.Println("no cache yet")
+			return nil
+		}
+		for _, c := range caches {
+			mnt := c.mnt
+			if mnt == "" {
+				mnt = "(unknown mount)"
+			}
+			line := fmt.Sprintf("%-40s %8s in %4d file(s)   %s", mnt, humanSize(c.size), c.n, c.dir)
+			if c.nLost > 0 {
+				line += fmt.Sprintf("\n%-40s %8s in %4d file(s) of unsaved changes from a crash in %s", "", humanSize(c.lostSize), c.nLost, filepath.Join(c.dir, pfs.LostFound))
+			}
+			fmt.Println(line)
+		}
+		return nil
+	}
+	if args[0] != "clear" || len(args) > 2 {
+		return errors.New("usage: protonfs cache [clear [DIR]]")
+	}
+	var targets []cacheInfo
+	if len(args) == 2 {
+		mnt, err := absDir(args[1])
+		if err != nil {
+			return err
+		}
+		targets = []cacheInfo{{dir: instanceCacheDir(mnt), mnt: mnt}}
+	} else {
+		targets = listCaches()
+	}
+	for _, c := range targets {
+		if err := clearOne(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clearOne clears one mount's cache. A running service is stopped first (which
+// uploads pending changes) and started again afterwards.
+func clearOne(c cacheInfo) error {
+	restart := ""
+	if c.mnt != "" && isMounted(c.mnt) {
+		name, err := unitName(c.mnt)
+		if err != nil {
+			return err
+		}
+		if exec.Command("systemctl", "--user", "is-active", "--quiet", name).Run() != nil {
+			return fmt.Errorf("%s is mounted outside the service; unmount it first", c.mnt)
+		}
+		fmt.Printf("Stopping %s (pending uploads finish first)...\n", name)
+		if err := systemctl("stop", name); err != nil {
+			return err
+		}
+		restart = name
+	}
+	n, size := cachedFiles(c.dir)
+	if err := clearCacheDir(c.dir); err != nil {
+		return err
+	}
+	n2, size2 := cachedFiles(c.dir)
+	label := c.mnt
+	if label == "" {
+		label = c.dir
+	}
+	fmt.Printf("%s: freed %s (%d file(s))\n", label, humanSize(size-size2), n-n2)
+	if l, _ := pfs.DirFiles(filepath.Join(c.dir, pfs.LostFound)); l > 0 {
+		fmt.Printf("  note: %s still holds %d file(s) of unsaved changes from a crash\n", filepath.Join(c.dir, pfs.LostFound), l)
+	}
+	if restart != "" {
+		return systemctl("start", restart)
+	}
+	return nil
 }
 
 func cmdStatus() error {
@@ -513,7 +721,8 @@ func cmdStatus() error {
 		if isMounted(mnt) {
 			state += ", mounted"
 		}
-		fmt.Printf("%-40s %s\n", mnt, state)
+		_, size := cachedFiles(instanceCacheDir(mnt))
+		fmt.Printf("%-40s %-20s cache %s\n", mnt, state, humanSize(size))
 	}
 	return nil
 }

@@ -18,11 +18,17 @@ import (
 //	rev-<hash>      complete, clean content of one file revision (evictable)
 //	rev-<hash>.part download in progress
 //	dirty-<random>  locally modified content not yet uploaded (never evicted)
+//	lost+found/     unsaved data recovered after a crash (left for the user)
 //
 // Clean files are keyed by revision UID, so they stay valid across remounts.
+// A revision is removed when the cache exceeds Max (least recently used
+// first), when it hasn't been used for MaxAge, or when it is Forgotten
+// because the file was deleted or replaced. Pinned revisions (open files)
+// are never removed while pinned.
 type Cache struct {
-	Dir string
-	Max int64
+	Dir    string
+	Max    int64
+	MaxAge time.Duration // 0: no age limit
 
 	mu    sync.Mutex
 	items map[string]*cacheItem // key: file name (rev-<hash>)
@@ -33,17 +39,23 @@ type cacheItem struct {
 	size     int64
 	lastUsed time.Time
 	refs     int
+	doomed   bool // delete as soon as it is unpinned
 }
 
-func OpenCache(dir string, max int64) (*Cache, error) {
+// LostFound is the directory, inside a cache dir, holding unsaved data
+// recovered after a crash.
+const LostFound = "lost+found"
+
+func OpenCache(dir string, max int64, maxAge time.Duration) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	c := &Cache{Dir: dir, Max: max, items: map[string]*cacheItem{}}
+	c := &Cache{Dir: dir, Max: max, MaxAge: maxAge, items: map[string]*cacheItem{}}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
+	lf := filepath.Join(dir, LostFound)
 	for _, de := range ents {
 		name := de.Name()
 		p := filepath.Join(dir, name)
@@ -52,10 +64,8 @@ func OpenCache(dir string, max int64) (*Cache, error) {
 			os.Remove(p)
 		case strings.HasPrefix(name, "dirty-"):
 			// Unsaved data from a crash: keep it where the user can find it.
-			lf := filepath.Join(dir, "lost+found")
 			os.MkdirAll(lf, 0o700)
 			os.Rename(p, filepath.Join(lf, name))
-			log.Printf("unsaved data from a previous run moved to %s", lf)
 		case strings.HasPrefix(name, "rev-"):
 			if info, err := de.Info(); err == nil {
 				c.items[name] = &cacheItem{size: info.Size(), lastUsed: info.ModTime()}
@@ -63,8 +73,44 @@ func OpenCache(dir string, max int64) (*Cache, error) {
 			}
 		}
 	}
-	c.evict()
+	if n, size := DirFiles(lf); n > 0 {
+		log.Printf("WARNING: %d file(s) (%d bytes) of unsaved changes from an earlier crash are in %s; "+
+			"protonfs can't tell which Drive files they belong to. Recover what you need, then delete them.", n, size, lf)
+	}
+	c.mu.Lock()
+	c.evictLocked()
+	c.mu.Unlock()
+	if maxAge > 0 {
+		go c.sweepLoop()
+	}
 	return c, nil
+}
+
+// DirFiles counts the regular files directly in dir and their total size.
+func DirFiles(dir string) (n int, size int64) {
+	ents, _ := os.ReadDir(dir)
+	for _, de := range ents {
+		if info, err := de.Info(); err == nil && info.Mode().IsRegular() {
+			n++
+			size += info.Size()
+		}
+	}
+	return n, size
+}
+
+func (c *Cache) sweepLoop() {
+	every := c.MaxAge / 24
+	if every < time.Minute {
+		every = time.Minute
+	}
+	if every > time.Hour {
+		every = time.Hour
+	}
+	for range time.Tick(every) {
+		c.mu.Lock()
+		c.evictLocked()
+		c.mu.Unlock()
+	}
 }
 
 func revKey(revUID string) string {
@@ -87,6 +133,7 @@ func (c *Cache) Acquire(revUID string) string {
 		return ""
 	}
 	it.refs++
+	it.doomed = false // wanted again after all
 	it.lastUsed = time.Now()
 	p := c.path(key)
 	os.Chtimes(p, it.lastUsed, it.lastUsed)
@@ -100,11 +147,15 @@ func (c *Cache) Release(revUID string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if it := c.items[revKey(revUID)]; it != nil && it.refs > 0 {
+	key := revKey(revUID)
+	if it := c.items[key]; it != nil && it.refs > 0 {
 		it.refs--
 		it.lastUsed = time.Now()
+		if it.refs == 0 && it.doomed {
+			c.removeLocked(key)
+		}
 	}
-	c.evict()
+	c.evictLocked()
 }
 
 // PartPath is where a download of revUID is written before Commit.
@@ -132,7 +183,7 @@ func (c *Cache) Commit(from, revUID string, size int64) (string, error) {
 	}
 	c.items[key] = &cacheItem{size: size, lastUsed: time.Now(), refs: 1}
 	c.total += size
-	c.evict()
+	c.evictLocked()
 	return to, nil
 }
 
@@ -153,19 +204,40 @@ func (c *Cache) Detach(revUID string) (string, error) {
 	return to, nil
 }
 
-// Forget drops a revision (e.g. superseded) unless it is pinned.
+// Forget drops a revision that is no longer needed (its file was deleted or
+// replaced by a newer revision). If it is pinned, it is dropped on release.
 func (c *Cache) Forget(revUID string) {
+	if revUID == "" {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := revKey(revUID)
-	if it := c.items[key]; it != nil && it.refs == 0 {
-		os.Remove(c.path(key))
-		c.total -= it.size
-		delete(c.items, key)
+	if it := c.items[key]; it != nil {
+		if it.refs > 0 {
+			it.doomed = true
+		} else {
+			c.removeLocked(key)
+		}
 	}
 }
 
-func (c *Cache) evict() {
+func (c *Cache) removeLocked(key string) {
+	it := c.items[key]
+	os.Remove(c.path(key))
+	c.total -= it.size
+	delete(c.items, key)
+}
+
+func (c *Cache) evictLocked() {
+	if c.MaxAge > 0 {
+		cutoff := time.Now().Add(-c.MaxAge)
+		for k, it := range c.items {
+			if it.refs == 0 && it.lastUsed.Before(cutoff) {
+				c.removeLocked(k)
+			}
+		}
+	}
 	if c.total <= c.Max {
 		return
 	}
@@ -178,13 +250,10 @@ func (c *Cache) evict() {
 		if c.total <= c.Max {
 			return
 		}
-		it := c.items[k]
-		if it.refs > 0 {
+		if c.items[k].refs > 0 {
 			continue
 		}
-		os.Remove(c.path(k))
-		c.total -= it.size
-		delete(c.items, k)
+		c.removeLocked(k)
 	}
 }
 
