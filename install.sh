@@ -140,6 +140,7 @@ if [ -z "$PD" ]; then
         if (!f) process.exit(1);
         console.log(f.Url, f.Sha512CheckSum);
     ' "$TMP/version.json" "$PDARCH") || die "no Proton Drive CLI build for linux/$PDARCH"
+    # shellcheck disable=SC2086  # split "URL SHA512" into $1 $2
     set -- $pdinfo
     fetch "$1" "$TMP/proton-drive"
     [ "$(sha512sum "$TMP/proton-drive" | cut -d' ' -f1)" = "$2" ] || die "checksum mismatch for proton-drive"
@@ -178,6 +179,7 @@ linger=""
 case "$PROTONFS_LINGER" in y|Y|yes|YES|1|true) linger="--linger" ;; esac
 
 bold "Enabling service"
+# shellcheck disable=SC2086  # $linger is empty or one flag
 "$BIN_DIR/protonfs" enable "$PROTONFS_MOUNT" $linger
 
 echo

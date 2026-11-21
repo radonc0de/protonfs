@@ -39,6 +39,28 @@ jobs:
           npm run build
           cp dist/protonfs-bridge.mjs ../dist/
 
+      - name: License notices
+        run: |
+          {
+            echo "protonfs is licensed under GPL-3.0-or-later; see LICENSE."
+            echo "Source code: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME}"
+            echo
+            echo "==== protonfs binary: Go modules ===="
+            for mod in $(go list -deps -f '{{with .Module}}{{if not .Main}}{{.Path}}@{{.Version}}{{end}}{{end}}' ./cmd/protonfs | sort -u); do
+              dir=$(go list -m -f '{{.Dir}}' "$mod")
+              echo; echo "---- $mod ----"
+              cat "$dir"/LICENSE* 2>/dev/null || echo "(no license file found)"
+            done
+            echo
+            echo "==== protonfs-bridge.mjs: bundled npm packages ===="
+            cat bridge/dist/protonfs-bridge.mjs.LEGAL.txt
+            for pkg in @protontech/drive-sdk @protontech/crypto openpgp; do
+              echo; echo "---- $pkg ----"
+              cat bridge/node_modules/$pkg/LICENSE* 2>/dev/null || echo "(license: $(node -p "require('./bridge/node_modules/$pkg/package.json').license"))"
+            done
+          } > dist/THIRD_PARTY_NOTICES.txt
+          cp LICENSE dist/LICENSE
+
       - name: Checksums
         working-directory: dist
         run: sha256sum protonfs-linux-* protonfs-bridge.mjs > SHA256SUMS

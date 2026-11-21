@@ -1,5 +1,8 @@
 # protonfs
 
+[![ci](https://github.com/radonc0de/protonfs/actions/workflows/ci.yml/badge.svg)](https://github.com/radonc0de/protonfs/actions/workflows/ci.yml)
+[![license: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+
 Mount [Proton Drive](https://proton.me/drive) as a normal Linux filesystem, in any directory you own, automatically at every login.
 
 ```sh
@@ -94,4 +97,10 @@ go build -o protonfs ./cmd/protonfs
 ./protonfs mount /some/dir               # finds bridge/dist next to the binary
 ```
 
-Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed.
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed. See [CONTRIBUTING.md](CONTRIBUTING.md) for development notes; report security issues privately as described in [SECURITY.md](SECURITY.md).
+
+## License
+
+protonfs is free software under the [GNU GPL v3.0 or later](LICENSE). The released bridge bundles Proton's GPL-3.0 [`@protontech/crypto`](https://www.npmjs.com/package/@protontech/crypto); each release includes `THIRD_PARTY_NOTICES.txt` with the licenses of all bundled dependencies.
+
+"Proton" and "Proton Drive" are trademarks of Proton AG. This project is not affiliated with or endorsed by Proton.
